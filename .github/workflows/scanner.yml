@@ -1,41 +1,26 @@
 name: scanner
-
 on:
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
-concurrency:
-  group: scanner
-  cancel-in-progress: false
-
 jobs:
-  run:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
+          python-version: "3.11"
+      - run: pip install requests
       - name: Restore state
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: state.json
-          key: state-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            state-
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: scanner-state-
       - name: Run scanner
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-          MAX_PENDING: "3000"
-        run: timeout 21000 python scanner.py || true
-      - name: Save state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state.json
-          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: python scanner.py
