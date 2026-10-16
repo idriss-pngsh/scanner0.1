@@ -1,34 +1,37 @@
 """
-Solana memecoin quality scanner (DexScreener + RugCheck -> Telegram).
-
-Finds tokens with decent distribution and low clustering, not just new launches.
-Candidates: DexScreener latest profiles + boosts. Each one must survive an
-age window and then pass hard filters and a quality score.
-
+Solana memecoin scanner, two-tier alerts (DexScreener + RugCheck -> Telegram).
 Env vars: TG_TOKEN, TG_CHAT
 """
-import json, os, time
+import html, json, os, time
 import requests
 
-# ---------- SETTINGS (tune these) ----------
-MIN_MCAP = 30_000          # market cap floor, no ceiling
-MIN_AGE_MIN = 45           # skip anything younger than this (fresh rugs die here)
+# ---------- SETTINGS ----------
+MIN_MCAP = 30_000
+MIN_AGE_MIN = 10            # pair must be at least this old (post-migration settle time)
 MAX_AGE_DAYS = 30
-MIN_LIQ_RATIO = 0.05       # liquidity / mcap
-MIN_LIQ_USD = 8_000
-MAX_TOP1_PCT = 6.0         # biggest single holder
-MAX_TOP10_PCT = 35.0       # top 10 holders combined
-MIN_HOLDERS = 150
-MIN_SCORE = 65             # 0-100
-REALERT_HOLDER_GROWTH = 0.25   # follow-up alert if holders grow 25% after alert
-MAX_CANDIDATES = 60
+MIN_LP_BURNED_PCT = 90      # RugCheck lpLockedPct needed to count as "burned"
+REQUIRE_DEX_PAID = False    # set True to require a paid DexScreener profile
+REALERT_HOLDER_GROWTH = 0.25
+MAX_CANDIDATES = 80
 STATE_FILE = "state.json"
-# --------------------------------------------
+
+LIMITS = {
+    "A": dict(top10=30, top1=8,  holders=100, dev=5, bundle=12, liq=0.10),
+    "B": dict(top10=35, top1=10, holders=80,  dev=7, bundle=15, liq=0.08),
+}
+# ------------------------------
 
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT")
 DEX = "https://api.dexscreener.com"
 RUG = "https://api.rugcheck.xyz/v1/tokens"
+RANK = {"A": 2, "B": 1}
+ICON = {"A": "🟢 A-TIER", "B": "🟡 B-TIER"}
+BURN_ADDR = {
+    "1nc1nerator11111111111111111111111111111111",
+    "11111111111111111111111111111111",
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # Raydium authority
+}
 
 
 def get(url, **kw):
@@ -45,19 +48,16 @@ def candidates():
     mints = []
     for path in ("/token-profiles/latest/v1", "/token-boosts/latest/v1",
                  "/token-boosts/top/v1"):
-        data = get(DEX + path) or []
-        for x in data:
+        for x in get(DEX + path) or []:
             if x.get("chainId") == "solana" and x.get("tokenAddress"):
                 mints.append(x["tokenAddress"])
     return list(dict.fromkeys(mints))[:MAX_CANDIDATES]
 
 
 def best_pairs(mints):
-    """Return {mint: best pair by liquidity}, 30 addresses per call."""
     out = {}
     for i in range(0, len(mints), 30):
-        chunk = mints[i:i + 30]
-        data = get(f"{DEX}/latest/dex/tokens/{','.join(chunk)}") or {}
+        data = get(f"{DEX}/latest/dex/tokens/{','.join(mints[i:i+30])}") or {}
         for p in data.get("pairs") or []:
             if p.get("chainId") != "solana":
                 continue
@@ -68,95 +68,94 @@ def best_pairs(mints):
     return out
 
 
-def pair_checks(p):
-    """Hard filters from DexScreener data. Returns (ok, reason)."""
+def dex_paid(mint):
+    data = get(f"{DEX}/orders/v1/solana/{mint}")
+    if not data:
+        return False
+    orders = data if isinstance(data, list) else data.get("orders", [])
+    return any(o.get("type") == "tokenProfile" and o.get("status") == "approved"
+               for o in orders)
+
+
+def pair_precheck(p):
     mcap = p.get("marketCap") or p.get("fdv") or 0
-    liq = (p.get("liquidity") or {}).get("usd") or 0
     created = p.get("pairCreatedAt")
-    if mcap < MIN_MCAP:
-        return False, "mcap"
-    if not created:
-        return False, "no age"
+    if mcap < MIN_MCAP or not created:
+        return False, "mcap/age"
     age_min = (time.time() * 1000 - created) / 60000
     if age_min < MIN_AGE_MIN or age_min > MAX_AGE_DAYS * 1440:
-        return False, "age"
-    if liq < MIN_LIQ_USD or liq / mcap < MIN_LIQ_RATIO:
-        return False, "liquidity"
+        return False, "age window"
+    info = p.get("info") or {}
+    if not (info.get("socials") or info.get("websites")):
+        return False, "no socials"
     return True, ""
 
 
-def rug_report(mint):
-    return get(f"{RUG}/{mint}/report")
+def clean_holders(rep):
+    """Top holders excluding LP/pool/burn accounts."""
+    excluded = set(BURN_ADDR)
+    for mk in rep.get("markets") or []:
+        for k in ("pubkey", "liquidityA", "liquidityB"):
+            if mk.get(k):
+                excluded.add(mk[k])
+    return [h for h in rep.get("topHolders") or []
+            if h.get("address") not in excluded and h.get("owner") not in excluded]
 
 
-def holder_stats(rep):
-    holders = rep.get("topHolders") or []
-    pcts = sorted([h.get("pct") or 0 for h in holders], reverse=True)
-    top1 = pcts[0] if pcts else 0
-    top10 = sum(pcts[:10])
-    insiders = sum(1 for h in holders if h.get("insider"))
-    return top1, top10, insiders
-
-
-def lp_locked(rep):
+def lp_burned(rep):
     best = 0
-    for m in rep.get("markets") or []:
-        lp = m.get("lp") or {}
-        best = max(best, lp.get("lpLockedPct") or 0)
+    for mk in rep.get("markets") or []:
+        best = max(best, (mk.get("lp") or {}).get("lpLockedPct") or 0)
     return best
 
 
-def evaluate(p, rep):
-    """Return (score, reasons, failed_hard)."""
-    if rep.get("mintAuthority") or rep.get("freezeAuthority"):
-        return 0, ["mint/freeze authority active"], True
-    if rep.get("graphInsidersDetected") or rep.get("insiderNetworks"):
-        return 0, ["insider network detected"], True
-    top1, top10, insiders = holder_stats(rep)
-    holders = rep.get("totalHolders") or 0
-    if top1 > MAX_TOP1_PCT or top10 > MAX_TOP10_PCT:
-        return 0, [f"concentrated top1 {top1:.1f}% top10 {top10:.1f}%"], True
-    if holders < MIN_HOLDERS:
-        return 0, ["few holders"], True
-
-    score, why = 0, []
-    # distribution (35)
-    d = 35 * (1 - top10 / MAX_TOP10_PCT)
-    score += max(0, d)
-    why.append(f"top1 {top1:.1f}% / top10 {top10:.1f}%")
-    # clustering (15)
-    if insiders == 0:
-        score += 15
-    else:
-        score += max(0, 15 - insiders * 5)
-        why.append(f"{insiders} insider-flagged holders")
-    # holders (10)
-    score += min(10, holders / 100)
-    # lp lock/burn (10)
-    lock = lp_locked(rep)
-    score += 10 * min(1, lock / 90)
-    why.append(f"LP locked/burned {lock:.0f}%")
-    # buy pressure (15)
-    tx = p.get("txns") or {}
-    for key, pts in (("h1", 7), ("h6", 8)):
-        b, s = (tx.get(key) or {}).get("buys", 0), (tx.get(key) or {}).get("sells", 0)
-        if b + s >= 20:
-            score += pts * min(1, (b / max(s, 1)) / 1.2)
-    # price health (15)
-    pc = p.get("priceChange") or {}
-    h6, h24 = pc.get("h6") or 0, pc.get("h24") or 0
-    if h6 > -25:
-        score += 8
-    if h24 > -50:
-        score += 7
-    if h24 > 400:
-        score -= 15
-        why.append("already pumped hard 24h")
-    # liquidity depth bonus
+def metrics(p, rep):
+    hs = clean_holders(rep)
+    pcts = sorted([h.get("pct") or 0 for h in hs], reverse=True)
+    creator = rep.get("creator")
+    dev = sum(h.get("pct") or 0 for h in hs
+              if creator and creator in (h.get("owner"), h.get("address")))
+    bundle = sum(h.get("pct") or 0 for h in hs if h.get("insider"))
     mcap = p.get("marketCap") or p.get("fdv") or 1
     liq = (p.get("liquidity") or {}).get("usd") or 0
-    score += min(0, 0) + (5 if liq / mcap > 0.1 else 0)
-    return round(min(score, 100)), why, False
+    return dict(
+        top1=pcts[0] if pcts else 0,
+        top10=sum(pcts[:10]),
+        holders=rep.get("totalHolders") or 0,
+        dev=dev,
+        bundle=bundle,
+        liq=liq / mcap,
+        lp=lp_burned(rep),
+        mcap=mcap,
+        liq_usd=liq,
+    )
+
+
+def fails_for(mt, lim):
+    f = []
+    if mt["top10"] > lim["top10"]: f.append(f"top10 {mt['top10']:.1f}%")
+    if mt["top1"] > lim["top1"]: f.append(f"top1 {mt['top1']:.1f}%")
+    if mt["holders"] < lim["holders"]: f.append(f"holders {mt['holders']}")
+    if mt["dev"] > lim["dev"]: f.append(f"dev {mt['dev']:.1f}%")
+    if mt["bundle"] > lim["bundle"]: f.append(f"bundle {mt['bundle']:.1f}%")
+    if mt["liq"] < lim["liq"]: f.append(f"liq {mt['liq']*100:.1f}% of mcap")
+    return f
+
+
+def classify(rep, mt):
+    """Return (tier or None, fail reasons)."""
+    if rep.get("mintAuthority"):
+        return None, ["mint authority active"]
+    if rep.get("freezeAuthority"):
+        return None, ["freeze authority active"]
+    if mt["lp"] < MIN_LP_BURNED_PCT:
+        return None, [f"LP burned {mt['lp']:.0f}%"]
+    if not fails_for(mt, LIMITS["A"]):
+        return "A", []
+    fb = fails_for(mt, LIMITS["B"])
+    if not fb:
+        return "B", []
+    return None, fb
 
 
 def tg(msg):
@@ -171,17 +170,16 @@ def tg(msg):
     )
 
 
-def fmt(m, p, rep, score, why, tag):
-    base = p["baseToken"]
-    mcap = p.get("marketCap") or p.get("fdv") or 0
-    liq = (p.get("liquidity") or {}).get("usd") or 0
+def fmt(m, p, mt, tier, tag):
+    sym = html.escape(p["baseToken"]["symbol"])
     age_h = (time.time() * 1000 - p["pairCreatedAt"]) / 3.6e6
     pc = p.get("priceChange") or {}
     return (
-        f"<b>{tag} ${base['symbol']}</b>  score {score}/100\n"
-        f"MC ${mcap:,.0f} | Liq ${liq:,.0f} | Age {age_h:.1f}h\n"
-        f"Holders {rep.get('totalHolders')} | 1h {pc.get('h1')}% | 24h {pc.get('h24')}%\n"
-        f"{' | '.join(why)}\n"
+        f"<b>{ICON[tier]} | {tag} ${sym}</b>\n"
+        f"MC ${mt['mcap']:,.0f} | Liq ${mt['liq_usd']:,.0f} ({mt['liq']*100:.1f}%) | Age {age_h:.1f}h\n"
+        f"Holders {mt['holders']} | 1h {pc.get('h1')}% | 24h {pc.get('h24')}%\n"
+        f"Top10 {mt['top10']:.1f}% | Top1 {mt['top1']:.1f}% | Dev {mt['dev']:.1f}% | Bundle {mt['bundle']:.1f}%\n"
+        f"LP burned {mt['lp']:.0f}% | Mint/Freeze revoked\n"
         f"<code>{m}</code>\n"
         f"https://dexscreener.com/solana/{m}\n"
         f"https://rugcheck.xyz/tokens/{m}"
@@ -195,27 +193,34 @@ def main():
     print(f"{len(mints)} candidates, {len(pairs)} with pairs")
 
     for m, p in pairs.items():
-        ok, _ = pair_checks(p)
+        sym = p["baseToken"]["symbol"]
+        ok, why = pair_precheck(p)
         if not ok:
             continue
-        rep = rug_report(m)
-        time.sleep(0.6)  # be nice to RugCheck
+        if REQUIRE_DEX_PAID and not dex_paid(m):
+            print(f"REJECT {sym}: not dex paid")
+            continue
+        rep = get(f"{RUG}/{m}/report")
+        time.sleep(0.6)
         if not rep:
             continue
-        score, why, failed = evaluate(p, rep)
-        if failed or score < MIN_SCORE:
+        mt = metrics(p, rep)
+        tier, reasons = classify(rep, mt)
+        if not tier:
+            print(f"REJECT {sym}: {', '.join(reasons)}")
             continue
 
-        holders = rep.get("totalHolders") or 0
         prev = state.get(m)
         if not prev:
-            tg(fmt(m, p, rep, score, why, "NEW"))
-            state[m] = {"t": time.time(), "holders": holders, "score": score}
-        elif holders >= prev["holders"] * (1 + REALERT_HOLDER_GROWTH):
-            tg(fmt(m, p, rep, score, why, "STILL STRONG"))
-            state[m].update({"holders": holders, "score": score, "t": time.time()})
+            tg(fmt(m, p, mt, tier, "NEW"))
+        elif RANK[tier] > RANK[prev.get("tier", "B")]:
+            tg(fmt(m, p, mt, tier, "⬆️ UPGRADED"))
+        elif mt["holders"] >= prev["holders"] * (1 + REALERT_HOLDER_GROWTH):
+            tg(fmt(m, p, mt, tier, "🔥 STILL STRONG"))
+        else:
+            continue
+        state[m] = {"t": time.time(), "holders": mt["holders"], "tier": tier}
 
-    # drop stale state (> 14 days)
     cutoff = time.time() - 14 * 86400
     state = {k: v for k, v in state.items() if v["t"] > cutoff}
     json.dump(state, open(STATE_FILE, "w"))
