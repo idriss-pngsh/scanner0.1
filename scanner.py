@@ -186,7 +186,8 @@ def fmt(m, p, mt, tier, tag):
     )
 
 
-def main():
+def main(    print("TG configured:", bool(TG_TOKEN), bool(TG_CHAT))
+):
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     mints = candidates()
     pairs = best_pairs(mints)
