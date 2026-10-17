@@ -7,7 +7,7 @@ import requests
 
 # ---------- SETTINGS ----------
 MIN_MCAP = 30_000
-MIN_AGE_MIN = 10            # pair must be at least this old (post-migration settle time)
+MIN_AGE_MIN = 30            # pair must be at least this old (post-migration settle time)
 MAX_AGE_DAYS = 30
 MIN_LP_BURNED_PCT = 90      # RugCheck lpLockedPct needed to count as "burned"
 REQUIRE_DEX_PAID = False    # set True to require a paid DexScreener profile
@@ -186,8 +186,7 @@ def fmt(m, p, mt, tier, tag):
     )
 
 
-def main(    print("TG configured:", bool(TG_TOKEN), bool(TG_CHAT))
-):
+def main()
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     mints = candidates()
     pairs = best_pairs(mints)
