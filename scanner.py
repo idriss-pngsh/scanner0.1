@@ -186,7 +186,7 @@ def fmt(m, p, mt, tier, tag):
     )
 
 
-def main()
+def main():.
 
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     mints = candidates()
